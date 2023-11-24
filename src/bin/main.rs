@@ -72,7 +72,9 @@ impl Fragments for Vec<Fragment> {
                         || content.contains("PUT")
                         || content.contains("PATCH")
                         || content.contains("DELETE")
-                        || content.contains("web::");
+                        || content.contains("web ::")
+                        || content.contains("HttpResponse")
+                        || content.contains("actix_web ::");
 
                     if is_api_resource {
                         fragments.push(Fragment::ApiResource { name: sig, content });
@@ -316,7 +318,7 @@ impl Modules for Vec<Module> {
             .collect_vec();
 
         let api_resources = Module::Lib {
-            name: "resource".to_string(),
+            name: "resources".to_string(),
             content: modules.mod_text(),
             modules,
         };
@@ -376,21 +378,24 @@ impl Modules for Vec<Module> {
             .flatten()
             .collect_vec();
 
-        let common = Module::Lib {
-            name: "common".to_string(),
-            content: lib_use_text.to_owned()
-                + fragments
-                    .iter()
-                    .filter_map(|fragment| match fragment {
-                        Fragment::Common { content } => Some(content.to_string()),
-                        _ => None,
-                    })
-                    .join("\n")
-                    .as_str(),
-            modules: vec![],
-        };
+        let mut res = vec![api_resources, functions, models, consts];
 
-        let mut res = vec![api_resources, functions, models, consts, common];
+        let content = fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Common { content } => Some(content.to_string()),
+                _ => None,
+            })
+            .join("\n");
+
+        if !content.is_empty() {
+            let common = Module::Lib {
+                name: "common".to_string(),
+                content: lib_use_text.to_owned() + content.as_str(),
+                modules: vec![],
+            };
+            res.push(common);
+        }
 
         res.extend(modules);
 
