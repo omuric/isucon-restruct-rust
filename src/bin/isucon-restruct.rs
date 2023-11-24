@@ -375,7 +375,7 @@ impl Modules for Vec<Module> {
             })
             .join("\n");
 
-        let lib_use_text = format!("use crate::*;\n{}", use_text);
+        let lib_use_text = format!("{}\nuse crate::*;", use_text);
 
         let modules = fragments
             .iter()
