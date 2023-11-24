@@ -190,7 +190,11 @@ impl Fragments for Vec<Fragment> {
                         content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
-                Item::Macro(_) => {}
+                Item::Macro(item) => {
+                    fragments.push(Fragment::Common {
+                        content: comment + &*item.to_token_stream().to_string(),
+                    });
+                }
                 Item::Mod(item) => {
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Mod {
