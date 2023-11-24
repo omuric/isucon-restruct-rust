@@ -86,6 +86,8 @@ dependencies = [
  "anyhow",
  "heck 0.4.1",
  "itertools",
+ "proc-macro2",
+ "quote",
  "structopt",
  "syn 2.0.39",
 ]

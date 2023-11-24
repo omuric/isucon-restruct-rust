@@ -1,11 +1,13 @@
 use heck::ToSnakeCase;
 use itertools::Itertools;
+use proc_macro2::LineColumn;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use structopt::StructOpt;
 use syn::__private::{Span, ToTokens};
-use syn::{Item, Token, Visibility};
+use syn::spanned::Spanned;
+use syn::{Item, ItemFn, Token, Visibility};
 
 #[derive(Clone, Debug)]
 enum Fragment {
@@ -39,8 +41,77 @@ enum Fragment {
     },
 }
 
+fn byte_offset(input: &str, location: LineColumn) -> usize {
+    let mut offset = 0;
+    for _ in 1..location.line {
+        offset += input[offset..].find('\n').unwrap() + 1;
+    }
+    offset
+        + input[offset..]
+            .chars()
+            .take(location.column)
+            .map(char::len_utf8)
+            .sum::<usize>()
+}
+
+struct ParseContext {
+    input: String,
+    current_offset: usize,
+}
+
+impl ParseContext {
+    fn update_offset(&mut self, offset: usize) {
+        self.current_offset = offset;
+    }
+    fn text_between(&self, offset: usize) -> String {
+        let start = self.current_offset;
+        let end = offset;
+        self.input[start..end].to_string()
+    }
+}
+
+fn parse_fn_code(ctx: &mut ParseContext, item: ItemFn) -> anyhow::Result<String> {
+    let mut code = String::new();
+
+    code += &*item
+        .attrs
+        .into_iter()
+        .map(|attr| attr.to_token_stream().to_string())
+        .join("");
+    code += " ";
+    code += &*item.vis.to_token_stream().to_string();
+    code += " ";
+    code += &*item.sig.to_token_stream().to_string();
+    code += " ";
+
+    code += "{";
+
+    ctx.update_offset(byte_offset(
+        &ctx.input,
+        item.block.brace_token.span.open().end(),
+    ));
+
+    for stmt in item.block.stmts {
+        let offset = byte_offset(&ctx.input, stmt.span().start());
+        let comment = ctx.text_between(offset);
+
+        code += &comment;
+        code += &*stmt.to_token_stream().to_string();
+
+        ctx.update_offset(byte_offset(&ctx.input, stmt.span().end()));
+    }
+
+    code += "}";
+
+    Ok(code)
+}
+
 trait Fragments {
-    fn parse(items: Vec<Item>) -> anyhow::Result<Self>
+    fn _parse(ctx: &mut ParseContext, items: Vec<Item>) -> anyhow::Result<Self>
+    where
+        Self: Sized;
+
+    fn parse(input: &str) -> anyhow::Result<Self>
     where
         Self: Sized;
 
@@ -50,36 +121,42 @@ trait Fragments {
 }
 
 impl Fragments for Vec<Fragment> {
-    fn parse(items: Vec<Item>) -> anyhow::Result<Self> {
+    fn _parse(ctx: &mut ParseContext, items: Vec<Item>) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
         let mut fragments = vec![];
 
         for item in items {
+            let offset = byte_offset(&ctx.input, item.span().start());
+            let comment = ctx.text_between(offset);
+            let span_end = item.span().end();
+
             match item {
                 Item::Fn(mut item) => {
                     let sig = item.sig.ident.to_token_stream().to_string();
                     if sig == "main" {
-                        fragments.push(Fragment::EntryPoint {
-                            content: item.to_token_stream().to_string(),
-                        });
-                        continue;
-                    }
-                    item.vis = Visibility::Public(Token![pub](Span::call_site()));
+                        let content = comment + parse_fn_code(ctx, item)?.as_str();
 
-                    let content = item.to_token_stream().to_string();
-
-                    let is_api_resource = content.contains("GET")
-                        || content.contains("POST")
-                        || content.contains("PUT")
-                        || content.contains("PATCH")
-                        || content.contains("DELETE")
-                        || content.contains("web ::")
-                        || content.contains("HttpResponse")
-                        || content.contains("actix_web ::");
-
-                    if is_api_resource {
-                        fragments.push(Fragment::ApiResource { name: sig, content });
+                        fragments.push(Fragment::EntryPoint { content });
                     } else {
-                        fragments.push(Fragment::Function { name: sig, content });
+                        item.vis = Visibility::Public(Token![pub](Span::call_site()));
+                        let content = comment + parse_fn_code(ctx, item)?.as_str();
+
+                        let is_api_resource = content.contains("GET")
+                            || content.contains("POST")
+                            || content.contains("PUT")
+                            || content.contains("PATCH")
+                            || content.contains("DELETE")
+                            || content.contains("web ::")
+                            || content.contains("HttpResponse")
+                            || content.contains("actix_web ::");
+
+                        if is_api_resource {
+                            fragments.push(Fragment::ApiResource { name: sig, content });
+                        } else {
+                            fragments.push(Fragment::Function { name: sig, content });
+                        }
                     }
                 }
                 Item::Struct(mut item) => {
@@ -88,30 +165,29 @@ impl Fragments for Vec<Fragment> {
                         field.vis = Visibility::Public(Token![pub](Span::call_site()));
                     });
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
-                    fragments.push(Fragment::Model {
-                        name: sig,
-                        content: item.to_token_stream().to_string(),
-                    });
+                    let content = comment + item.to_token_stream().to_string().as_str();
+
+                    fragments.push(Fragment::Model { name: sig, content });
                 }
                 Item::Enum(mut item) => {
                     item.vis = Visibility::Public(Token![pub](Span::call_site()));
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Const(mut item) => {
                     item.vis = Visibility::Public(Token![pub](Span::call_site()));
                     fragments.push(Fragment::Const {
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Impl(item) => {
                     let sig = item.self_ty.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Macro(_) => {}
@@ -121,14 +197,17 @@ impl Fragments for Vec<Fragment> {
                         name: sig,
                         fragments: item
                             .content
-                            .map(|(_, items)| Self::parse(items))
+                            .map(|(brace, items)| {
+                                ctx.update_offset(byte_offset(&ctx.input, brace.span.open().end()));
+                                Self::_parse(ctx, items)
+                            })
                             .transpose()?,
                     });
                 }
                 Item::Static(mut item) => {
                     item.vis = Visibility::Public(Token![pub](Span::call_site()));
                     fragments.push(Fragment::Const {
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Trait(mut item) => {
@@ -136,7 +215,7 @@ impl Fragments for Vec<Fragment> {
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::TraitAlias(mut item) => {
@@ -144,7 +223,7 @@ impl Fragments for Vec<Fragment> {
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Type(mut item) => {
@@ -152,12 +231,12 @@ impl Fragments for Vec<Fragment> {
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Use(item) => {
                     fragments.push(Fragment::Use {
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 Item::Union(mut item) => {
@@ -165,18 +244,29 @@ impl Fragments for Vec<Fragment> {
                     let sig = item.ident.to_token_stream().to_string().to_snake_case();
                     fragments.push(Fragment::Model {
                         name: sig,
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
                 _ => {
                     fragments.push(Fragment::Common {
-                        content: item.to_token_stream().to_string(),
+                        content: comment + &*item.to_token_stream().to_string(),
                     });
                 }
             }
+
+            ctx.update_offset(byte_offset(&ctx.input, span_end));
         }
 
         Ok(fragments)
+    }
+
+    fn parse(input: &str) -> anyhow::Result<Self> {
+        let ast = syn::parse_file(input)?;
+        let mut ctx = ParseContext {
+            input: input.to_string(),
+            current_offset: 0,
+        };
+        Self::_parse(&mut ctx, ast.items)
     }
 
     fn dedup_fragments(self) -> Self
@@ -450,9 +540,8 @@ impl Code {
         let path = path.into().to_string_lossy().to_string();
 
         let content = fs::read_to_string(path)?;
-        let ast = syn::parse_file(&content)?;
 
-        let fragments = Vec::<Fragment>::parse(ast.items)?;
+        let fragments = Vec::<Fragment>::parse(&content)?;
         let modules = Vec::<Module>::parse(fragments)?;
 
         Ok(Self { modules })
