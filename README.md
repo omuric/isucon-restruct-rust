@@ -13,3 +13,8 @@ cargo run -- --path ../isucon13-practice
 cd ../isucon13-practice
 cargo fix --allow-dirty && cargo fmt
 ```
+
+## Note
+
+* Not support macro used in root scope such as lazy_static
+* Rebuild main.rs only
